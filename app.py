@@ -6,7 +6,12 @@ import re
 from bs4 import BeautifulSoup
 
 app = FastAPI()
-client = httpx.AsyncClient(follow_redirects=True, timeout=30.0, limits=httpx.Limits(max_connections=200))
+# Global client for efficiency
+client = httpx.AsyncClient(
+    follow_redirects=True, 
+    timeout=30.0, 
+    limits=httpx.Limits(max_connections=200, max_keepalive_connections=20)
+)
 
 # Simple homepage
 @app.get("/", response_class=HTMLResponse)
@@ -15,41 +20,58 @@ async def home():
     <title>Koyeb Proxy</title>
     <style>body{font-family:system-ui;background:#111;color:#0f0;margin:40px;text-align:center}
     input,button{padding:15px;font-size:18px;margin:10px;width:90%;max-width:600px}</style>
-    <h1>Koyeb Proxy (Works on YouTube)</h1>
+    <h1>Koyeb Proxy (Full POST Support)</h1>
     <form action="/proxy" method="get">
-      <input name="q" placeholder="https://www.youtube.com" required>
+      <input name="q" placeholder="https://www.google.com" required>
       <button>Go →</button>
     </form>
+    <p><small>Now handles cookies, logins, & forms!</small></p>
     """
 
-# Main proxy endpoint – FIXED URL HANDLING
-@app.get("/proxy")
-@app.head("/proxy")  # Needed for some pre-flight checks
-async def proxy(request: Request, q: str = None):
-    if not q:
-        raise HTTPException(400, "Missing q= parameter")
+# Unified proxy endpoint – NOW HANDLES POST/PUT/OPTIONS TOO!
+@app.route("/proxy", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "OPTIONS"])
+async def proxy(request: Request):
+    # Parse query params
+    query_params = dict(request.query_params)
+    q = query_params.pop("q", None)
+    u = query_params.pop("u", None)
 
-    # Normalize URL
-    if not q.startswith(("http://", "https://")):
-        q = "https://" + q
+    if not q and not u:
+        raise HTTPException(400, "Missing q= or u= parameter")
 
-    target_url = q.strip()
+    target_url = u or q
+    if not target_url.startswith(("http://", "https://")):
+        target_url = "https://" + target_url
+
     parsed = urlparse(target_url)
     if not parsed.netloc:
         raise HTTPException(400, "Invalid URL")
 
-    # Build the prefix the proxy will use for rewriting
-    proxy_prefix = f"{request.base_url}proxy?q={quote(target_url)}"
+    # Build proxy prefix for rewriting (use the ORIGINAL q as base)
+    base_q = q or u
+    proxy_prefix = f"{request.base_url}proxy?q={quote(base_q)}"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": target_url + "/",
-    }
+    # Forward ALL headers from browser (but clean up proxy-specific ones)
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    headers.pop("content-length", None)  # We'll set this dynamically
+    headers["User-Agent"] = headers.get("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    headers["Accept"] = headers.get("accept", "*/*")
+    headers["Referer"] = target_url + "/" if "referer" not in headers else headers["referer"]
+    headers["Origin"] = parsed.scheme + "://" + parsed.netloc
+
+    # Forward body for POST/PUT/PATCH (forms, uploads, etc.)
+    body = await request.body()
 
     try:
-        resp = await client.get(target_url, headers=headers)
+        # Use the SAME method as the incoming request
+        resp = await client.request(
+            method=request.method,
+            url=target_url,
+            headers=headers,
+            content=body if body else None,
+            params=query_params if query_params else None  # Forward extra params
+        )
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=e.response.status_code, detail="Target site error")
@@ -59,67 +81,94 @@ async def proxy(request: Request, q: str = None):
     content_type = resp.headers.get("content-type", "").split(";")[0].lower()
     raw_bytes = resp.content
 
-    # Rewrite HTML
-    if content_type in ("text/html", "application/xhtml+xml"):
+    # Rewrite HTML (only for GET/HEAD, as POST responses are often JSON/redirects)
+    if request.method in ("GET", "HEAD") and content_type in ("text/html", "application/xhtml+xml"):
         text = resp.text
-
         soup = BeautifulSoup(text, "html.parser")
 
-        # <base> tag to make relative URLs work perfectly
+        # Add <base> for relative URLs
         if soup.head:
-            base_tag = soup.new_tag("base", href=target_url + "/")
-            soup.head.insert(0, base_tag)
+            base_tag = soup.new_tag("base", href=target_url.rstrip('/') + "/")
+            if soup.head.find("base") is None:
+                soup.head.insert(0, base_tag)
 
-        # Rewrite all common attributes
-        for attr in ("href", "src", "srcset", "data-src", "poster", "action", "data"):
+        # Rewrite links, scripts, images, forms, etc.
+        for attr in ("href", "src", "srcset", "data-src", "poster", "action", "formaction", "data"):
             for tag in soup.find_all(attrs={attr: True}):
                 old = tag[attr]
-                if old.startswith(("data:", "javascript:", "#")) or old.startswith(proxy_prefix):
+                if old.startswith(("data:", "javascript:", "#", "mailto:", "tel:")) or old.startswith(proxy_prefix):
                     continue
-                absolute = urljoin(target_url + "/", old)
-                tag[attr] = proxy_prefix + "&u=" + quote(absolute)
+                absolute = urljoin(target_url, old)
+                tag[attr] = f"{proxy_prefix}&u={quote(absolute)}"
 
-        # Handle inline style="background: url(...)"
+        # Rewrite inline styles (background:url(), etc.)
         for tag in soup.find_all(style=True):
             tag["style"] = re.sub(
-                r"url\(['\"]?(.*?)['\"]?\)",
-                lambda m: f"url({proxy_prefix}&u={quote(urljoin(target_url + '/', m.group(1)))})",
+                r'url\s*\(\s*["\']?(.*?)["\']?\s*\)',
+                lambda m: f'url("{proxy_prefix}&u={quote(urljoin(target_url, m.group(1)))}")',
                 tag["style"]
             )
 
+        # Rewrite forms to POST to proxy
+        for form in soup.find_all("form"):
+            if form.get("action"):
+                form["action"] = f"{proxy_prefix}&u={quote(urljoin(target_url, form['action']))}"
+
         raw_bytes = str(soup).encode("utf-8")
 
-    # Rewrite CSS files
+    # Rewrite CSS
     elif "text/css" in content_type:
         css = resp.text
         css = re.sub(
-            r"url\(['\"]?(.*?)['\"]?\)",
-            lambda m: f"url({proxy_prefix}&u={quote(urljoin(target_url + '/', m.group(1)))})",
+            r'url\s*\(\s*["\']?(.*?)["\']?\s*\)',
+            lambda m: f'url("{proxy_prefix}&u={quote(urljoin(target_url, m.group(1)))}")',
             css
         )
         raw_bytes = css.encode("utf-8")
 
-    # Stream everything else (videos, images, JS, etc.)
-    async def stream():
+    # For JS, light rewrite (won't catch dynamic fetches, but helps static ones)
+    elif "javascript" in content_type or "application/json" in content_type:
+        js = resp.text
+        # Basic URL replacement in strings
+        js = re.sub(
+            r'["\']((?:https?://[^"\']+))["\']',
+            lambda m: f'"{proxy_prefix}&u={quote(m.group(1))}"',
+            js
+        )
+        raw_bytes = js.encode("utf-8")
+
+    # OPTIONS for CORS (handles preflight requests)
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS, HEAD",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With",
+                "Access-Control-Max-Age": "86400",
+            }
+        )
+
+    # Stream the response (works for large files/videos)
+    async def stream_content():
         yield raw_bytes
 
+    response_headers = dict(resp.headers)
+    response_headers.pop("content-length", None)  # Avoid conflicts
+    response_headers["Access-Control-Allow-Origin"] = "*"
+    response_headers["X-Frame-Options"] = "ALLOWALL"  # Helps with embeds
+
     return StreamingResponse(
-        stream(),
+        stream_content(),
+        status_code=resp.status_code,
         media_type=resp.headers.get("content-type", "application/octet-stream"),
-        headers={
-            "Content-Disposition": resp.headers.get("content-disposition", ""),
-            "Cache-Control": "public, max-age=3600",
-            "Access-Control-Allow-Origin": "*",
-            "X-Frame-Options": "ALLOWALL",
-        }
+        headers=response_headers
     )
 
-# Sub-resource proxy (the real magic)
-@app.get("/proxy")
-@app.head("/proxy")
-async def proxy_subresource(request: Request, u: str):
-    # This handles all CSS/JS/images fetched after HTML rewrite
-    return await proxy(request, q=u)
+# Health check (add /health if needed)
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 @app.on_event("shutdown")
 async def shutdown():
