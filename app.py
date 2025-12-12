@@ -1,79 +1,123 @@
-from flask import Flask, request, Response, redirect, url_for
+from flask import Flask, request, Response, redirect, url_for, send_from_directory
 import requests
 import re
 from urllib.parse import urlparse, urljoin
+import os
 
 app = Flask(__name__)
 
-# Domains you want to allow (add more if you want)
-ALLOWED_DOMAINS = ["youtube.com", "youtu.be", "google.com", "discord.com", "spotify.com", "netflix.com"]
-
-def fix_url(url, base):
-    if not url:
-        return url
-    if url.startswith("http"):
-        return url
-    return urljoin(base, url)
+# Simple favicon so it stops 502 spamming your logs
+@app.route('/favicon.ico')
+def favicon():
+    return "", 204
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    url = request.args.get("q") or request.form.get("q")
+    url = request.args.get("q") or request.form.get("q", "").strip()
     if not url:
         return '''
-        <title>Proxy</title><center><h1>Koyeb Proxy</h1>
-        <form><input name="q" placeholder="https://youtube.com" style="width:80%;padding:15px;font-size:20px">
-        <button style="padding:15px">Go</button></form>
-        <p>Or visit https://your-app.koyeb.app/https://youtube.com</p>
+        <title>Koyeb Proxy</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>body{font-family:Arial;background:#111;color:#fff;text-align:center;padding:50px}</style>
+        <h1>Koyeb Proxy</h1>
+        <form method="get">
+            <input name="q" placeholder="https://youtube.com" autofocus style="width:90%;max-width:600px;padding:15px;font-size:18px">
+            <button style="padding:15px 25px;font-size:18px">Go</button>
+        </form>
+        <p style="margin-top:30px">Or just append the site: your-app.koyeb.app/youtube.com</p>
         '''
-    return redirect(url_for("proxy", path=url.lstrip("https://").lstrip("http://")))
+    if not url.startswith("http"):
+        url = "https://" + url
+    return redirect("/proxy/" + url)
 
-@app.route("/<path:path>")
-def proxy(path):
-    target = request.args.get("q")
-    if not target:
-        target = "https://" + path.split("?")[0]
-        if not any(domain in target.lower() for domain in ["."]):  # fallback
-            target = "https://" + path
-
-    # Force https
-    if not target.startswith("http"):
+@app.route("/proxy/<path:url>", methods=["GET", "POST"])
+def proxy(url):
+    # Reconstruct full target URL
+    target = url
+    if "://" not in target:
         target = "https://" + target
+    
+    # Add back query string if present
+    if request.query_string:
+        target += ("?" + request.query_string.decode())
 
-    headers = {k: v for k, v in request.headers if k.lower() not in ["host", "cf-connecting-ip"]}
+    headers = {}
+    for k, v in request.headers:
+        if k.lower() not in ["host", "content-length", "cf-connecting-ip"]:
+            headers[k] = v
+
+    # Good user agent (some sites block default Python UA)
     headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
     try:
-        r = requests.get(target, headers=headers, stream=True, timeout=30, allow_redirects=True)
+        resp = requests.request(
+            method=request.method,
+            url=target,
+            headers=headers,
+            data=request.get_data(),
+            cookies=request.cookies,
+            allow_redirects=False,  # We handle redirects manually
+            stream=True,
+            timeout=30
+        )
+    except Exception as e:
+        return f"<h1>Blocked or down</h1><p>{str(e)}</p>", 502
+
+    # Handle redirects properly inside proxy
+    if 300 <= resp.status_code < 400 and "location" in resp.headers:
+        location = resp.headers["location"]
+        if location.startswith("/"):
+            location = urlparse(target).scheme + "://" + urlparse(target).netloc + location
+        return redirect("/proxy/" + location)
+
+    # Safely decompress
+    content = b""
+    try:
+        for chunk in resp.iter_content(8192):
+            content += chunk
     except:
-        return "<h1>Request failed – bad URL or site blocked your IP</h1>", 502
+        return "Stream failed", 502
 
-    # Properly handle compressed content
-    content = r.content
-    if r.headers.get("Content-Encoding") == "gzip":
+    # Decompress if needed
+    if resp.headers.get("content-encoding") == "br":
+        try:
+            import brotli
+            content = brotli.decompress(content)
+        except:
+            pass  # ignore brotli errors
+    elif resp.headers.get("content-encoding") == "gzip":
         import gzip
-        content = gzip.decompress(content)
-    elif r.headers.get("Content-Encoding") == "br":
-        import brotli
-        content = brotli.decompress(content)
+        try:
+            content = gzip.decompress(content)
+        except:
+            pass
 
-    content_type = r.headers.get("Content-Type", "")
-    if "text/html" in content_type or "application/javascript" in content_type or "text/css" in content_type:
-        text = content.decode("utf-8", errors="ignore")
+    headers_out = {}
+    for k, v in resp.headers.items():
+        if k.lower() not in ["content-encoding", "transfer-encoding", "content-length", "set-cookie"]:
+            headers_out[k] = v
 
-        # Rewrite all URLs so they stay inside the proxy
-        base_url = target.rstrip("/") + "/"
-        text = re.sub(r'(href|src|action)=["\']/(?!/)', lambda m: f'{m.group(1)}="/{base_url.split("/",3)[2] if base_url.split("/",3)[2:] else ""}', text)
-        text = re.sub(r'(href|src|action)=["\'](?!https?:|//)', lambda m: m.group(1) + '="https://' + path.split("?")[0] + m.group(2), text)
-        text = text.replace('http://', 'https://').replace("window.location", "parent.location")
+    # Only rewrite HTML/JS/CSS
+    content_type = resp.headers.get("content-type", "")
+    if any(x in content_type for x in ["text/html", "javascript", "css"]):
+        try:
+            text = content.decode("utf-8", errors="ignore")
+            
+            # Fix all relative URLs
+            base = target.split("?")[0].rstrip("/") + "/"
+            text = re.sub(r'(href|src|action)=["\']\/', rf'\1="/proxy/{base}', text)
+            text = re.sub(r'(href|src|action)=["\']([^\/])', rf'\1="/proxy/{base}\2', text)
+            
+            # Prevent frames busting
+            text = text.replace("window.top", "window.self")
+            text = text.replace("window.parent", "window.self")
+            
+            content = text.encode("utf-8")
+            headers_out["content-length"] = str(len(content))
+        except:
+            pass
 
-        content = text.encode("utf-8")
-
-    resp_headers = {}
-    for k, v in r.headers.items():
-        if k.lower() not in ["content-encoding", "transfer-encoding", "content-length"]:
-            resp_headers[k] = v
-
-    return Response(content, status=r.status_code, headers=resp_headers, content_type=r.headers.get("Content-Type"))
+    return Response(content, status=resp.status_code, headers=headers_out, content_type=resp.headers.get("content-type"))
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
