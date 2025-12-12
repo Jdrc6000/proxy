@@ -1,123 +1,134 @@
-from flask import Flask, request, Response, redirect, url_for, send_from_directory
-import requests
-import re
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse, Response
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 from urllib.parse import urlparse, urljoin
-import os
+import httpx
+import re
+from bs4 import BeautifulSoup
 
-app = Flask(__name__)
+app = FastAPI(title="Koyeb URL Proxy")
+templates = Jinja2Templates(directory="templates")
 
-# Simple favicon so it stops 502 spamming your logs
-@app.route('/favicon.ico')
-def favicon():
-    return "", 204
+# Optional: serve a small static index page
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    url = request.args.get("q") or request.form.get("q", "").strip()
-    if not url:
-        return '''
+# Simple home page
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
         <title>Koyeb Proxy</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>body{font-family:Arial;background:#111;color:#fff;text-align:center;padding:50px}</style>
+        <style>
+            body {font-family: system-ui; text-align: center; padding: 50px; background: #0f0f23; color: #fff;}
+            input {width: 80%; padding: 15px; font-size: 18px; margin: 20px;}
+            button {padding: 15px 30px; font-size: 18px; background:#00ff9d; border:none; cursor:pointer;}
+        </style>
+    </head>
+    <body>
         <h1>Koyeb Proxy</h1>
-        <form method="get">
-            <input name="q" placeholder="https://youtube.com" autofocus style="width:90%;max-width:600px;padding:15px;font-size:18px">
-            <button style="padding:15px 25px;font-size:18px">Go</button>
+        <form action="/proxy" method="get">
+            <input type="url" name="url" placeholder="https://example.com" required>
+            <br>
+            <button type="submit">Go</button>
         </form>
-        <p style="margin-top:30px">Or just append the site: your-app.koyeb.app/youtube.com</p>
-        '''
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+# Main proxy endpoint
+@app.get("/proxy")
+async def proxy(url: str, request: Request):
     if not url.startswith("http"):
         url = "https://" + url
-    return redirect("/proxy/" + url)
 
-@app.route("/proxy/<path:url>", methods=["GET", "POST"])
-def proxy(url):
-    # Reconstruct full target URL
-    target = url
-    if "://" not in target:
-        target = "https://" + target
-    
-    # Add back query string if present
-    if request.query_string:
-        target += ("?" + request.query_string.decode())
+    parsed_target = urlparse(url)
+    if not parsed_target.scheme or not parsed_target.netloc:
+        raise HTTPException(400, "Invalid URL")
 
-    headers = {}
-    for k, v in request.headers:
-        if k.lower() not in ["host", "content-length", "cf-connecting-ip"]:
-            headers[k] = v
-
-    # Good user agent (some sites block default Python UA)
-    headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-
-    try:
-        resp = requests.request(
-            method=request.method,
-            url=target,
-            headers=headers,
-            data=request.get_data(),
-            cookies=request.cookies,
-            allow_redirects=False,  # We handle redirects manually
-            stream=True,
-            timeout=30
-        )
-    except Exception as e:
-        return f"<h1>Blocked or down</h1><p>{str(e)}</p>", 502
-
-    # Handle redirects properly inside proxy
-    if 300 <= resp.status_code < 400 and "location" in resp.headers:
-        location = resp.headers["location"]
-        if location.startswith("/"):
-            location = urlparse(target).scheme + "://" + urlparse(target).netloc + location
-        return redirect("/proxy/" + location)
-
-    # Safely decompress
-    content = b""
-    try:
-        for chunk in resp.iter_content(8192):
-            content += chunk
-    except:
-        return "Stream failed", 502
-
-    # Decompress if needed
-    if resp.headers.get("content-encoding") == "br":
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
         try:
-            import brotli
-            content = brotli.decompress(content)
-        except:
-            pass  # ignore brotli errors
-    elif resp.headers.get("content-encoding") == "gzip":
-        import gzip
-        try:
-            content = gzip.decompress(content)
-        except:
-            pass
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; KoyebProxy/1.0)"})
+            r.raise_for_status()
+        except httpx.RequestError as e:
+            raise HTTPException(502, f"Failed to reach target: {str(e)}")
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(e.response.status_code, f"Target returned {e.response.status_code}")
 
-    headers_out = {}
-    for k, v in resp.headers.items():
-        if k.lower() not in ["content-encoding", "transfer-encoding", "content-length", "set-cookie"]:
-            headers_out[k] = v
+    content_type = r.headers.get("content-type", "")
+    proxy_base = str(request.base_url) + "proxy?url=" + httpx.URL(url).encode()
 
-    # Only rewrite HTML/JS/CSS
-    content_type = resp.headers.get("content-type", "")
-    if any(x in content_type for x in ["text/html", "javascript", "css"]):
-        try:
-            text = content.decode("utf-8", errors="ignore")
-            
-            # Fix all relative URLs
-            base = target.split("?")[0].rstrip("/") + "/"
-            text = re.sub(r'(href|src|action)=["\']\/', rf'\1="/proxy/{base}', text)
-            text = re.sub(r'(href|src|action)=["\']([^\/])', rf'\1="/proxy/{base}\2', text)
-            
-            # Prevent frames busting
-            text = text.replace("window.top", "window.self")
-            text = text.replace("window.parent", "window.self")
-            
-            content = text.encode("utf-8")
-            headers_out["content-length"] = str(len(content))
-        except:
-            pass
+    # If it's HTML, rewrite links so the proxy stays active
+    if "text/html" in content_type or "application/xhtml+xml" in content_type:
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    return Response(content, status=resp.status_code, headers=headers_out, content_type=resp.headers.get("content-type"))
+        # Rewrite common attributes
+        for tag in soup.find_all(href=True):
+            tag["href"] = urljoin(url, tag["href"])
+            if not tag["href"].startswith(("http://", "https://", "mailto:", "tel:", "#")):
+                continue
+            tag["href"] = proxy_base + tag["href"]
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+        for tag in soup.find_all(src=True):
+            tag["src"] = urljoin(url, tag["src"])
+            tag["src"] = proxy_base + tag["src"]
+
+        for tag in soup.find_all(srcset=True):
+            sources = [s.strip() for s in tag["srcset"].split(",")]
+            new_sources = []
+            for s in sources:
+                if " " in s:
+                    src, desc = s.split(" ", 1)
+                    new_sources.append(proxy_base + urljoin(url, src) + " " + desc)
+                else:
+                    new_sources.append(proxy_base + urljoin(url, s))
+            tag["srcset"] = ", ".join(new_sources)
+
+        # Handle CSS @import and url()
+        if soup.style:
+            soup.style.string = rewrite_css_urls(soup.style.string, url, proxy_base)
+        for style_tag in soup.find_all(style=True):
+            style_tag["style"] = rewrite_css_urls(style_tag["style"], url, proxy_base)
+
+        content = str(soup)
+    else:
+        content = r.content
+
+    # Stream non-HTML content (videos, images, downloads)
+    if not ("text/html" in content_type or "text/css" in content_type or "javascript" in content_type):
+        def iter_content():
+            yield from r.iter_bytes(chunk_size=1024*64)
+        return StreamingResponse(iter_content(), media_type=content_type, headers={"Content-Disposition": r.headers.get("content-disposition", "")})
+
+    # For CSS/JS that might contain absolute URLs
+    if "text/css" in content_type:
+        content = rewrite_css_urls(r.text, url, proxy_base)
+    if "javascript" in content_type or "application/json" in content_type:
+        content = rewrite_js_urls(r.text, url, proxy_base)
+
+    return Response(content=content, media_type=content_type or "text/plain")
+
+def rewrite_css_urls(css: str, base_url: str, proxy_base: str):
+    if not css:
+        return css
+    def replace_url(match):
+        u = match.group(1).strip("'\"")
+        abs_url = urljoin(base_url, u)
+        return f"url('{proxy_base}{abs_url}')"
+    return re.sub(r"url\(['\"]?(.*?)['\"]?\)", replace_url, css)
+
+def rewrite_js_urls(js: str, base_url: str, proxy_base: str):
+    # Very light JS URL rewriting (won't catch everything, but helps)
+    def repl(m):
+        return m.group(1) + proxy_base + urljoin(base_url, m.group(2))
+    js = re.sub(r"([=,\s\('\"])(\s*['\"]?(https?:\/\/[^'\"]+?)['\"]?)", repl, js)
+    return js
+
+# Optional: health check for Koyeb
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
