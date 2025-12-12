@@ -1,3 +1,4 @@
-fastapi
-uvicorn[standard]
-httpx[http2]
+Flask==3.0.3
+requests==2.32.3
+gunicorn==23.0.0
+brotli==1.1.0
