@@ -11,10 +11,18 @@ HOP_BY_HOP = {
 }
 
 @app.api_route("/proxy", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
-async def proxy(request: Request, url: str | None = None, q: str | None = None, u: str | None = None):
+async def proxy(request: Request,
+                url: str | None = Query(None),
+                q: str | None = Query(None),
+                u: str | None = Query(None)):
+
     target = url or q or u
     if not target:
         raise HTTPException(status_code=400, detail="No URL provided.")
+
+    parsed = urlparse(target)
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="Only HTTP/HTTPS allowed.")
 
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
