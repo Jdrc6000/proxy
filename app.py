@@ -1,48 +1,72 @@
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse
-import httpx
-import re
+# app.py (or main.py / index.py – whatever your platform expects)
+from flask import Flask, Request, Response, request
+import requests
+import brotli
+import gzip
 
-app = FastAPI()
+app = Flask(__name__)
 
-client = httpx.AsyncClient(http2=True, follow_redirects=True, timeout=30)
+# List of sites that force brotli – we have to decompress manually
+def decompress(body: bytes, encoding: str) -> bytes:
+    if encoding == "br":
+        return brotli.decompress(body)
+    if encoding in ["gzip", "deflate"]:
+        return gzip.decompress(body)
+    return body
 
-def fix_headers(headers):
-    exclude = ["content-encoding", "content-length", "transfer-encoding", "connection"]
-    return {k: v for k, v in headers.items() if k.lower() not in exclude}
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def proxy(path):
+    url = request.args.get("url") or f"https://{path}"
 
-@app.get("/{path:path}")
-@app.post("/{path:path}")
-async def proxy(request: Request, path: str):
-    url = str(request.query_params.get("url", "") or f"https://{path}")
+    if not url.startswith("http"):
+        url = "https://" + url
 
+    # Show a tiny index page if no URL
     if url == "https://":
-        return Response(content="<h1>Enter a URL</h1><input style='width:600px;padding:10px' placeholder='https://youtube.com'><button onclick=\"location.href='?url='+document.querySelector('input').value\">Go</button>", media_type="text/html")
+        return '''
+        <title>Proxy</title><h2>Working proxy (brotli fixed)</h2>
+        <form><input name="url" placeholder="https://youtube.com" style="width:600px;padding:12px;font-size:20px">
+        <button style="padding:12px 30px;font-size:20px">Go</button></form>
+        <p>Or just visit yourapp.koyeb.app/youtube.com</p>
+        '''
 
     try:
-        r = await client.request(
-            method=request.method,
-            url=url,
-            headers={k: v for k, v in request.headers.items() if k.lower() not in ["host", "content-length"]},
-            content=await request.body(),
-            params=request.query_params if not request.query_params.get("url") else {}
+        r = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Encoding": "identity"},  # ← important: ask for no compression
+            cookies=request.cookies,
+            allow_redirects=True,
+            stream=False,
+            timeout=30
         )
 
-        # Let httpx auto-decompress (this is the key!)
+        # Force no compression from upstream (best solution)
         content = r.content
+        headers = dict(r.headers)
 
-        # Simple link rewriting so clicks stay in proxy
-        if "text/html" in r.headers.get("content-type", ""):
-            content = re.sub(b'href="/', f'href="/?url={url.rstrip("/")}/'.encode(), r.content, flags=re.I)
-            content = re.sub(b"src="/", f'src="/?url={url.rstrip("/")}/'.encode(), content, flags=re.I)
-            content = re.sub(b"href=\"//", b'href="/?url=https://', content)
-            content = re.sub(b"src=\"//", b'src="/?url=https://', content)
+        # If they still sent compressed data, decompress it
+        encoding = headers.get("content-encoding", "").lower()
+        if "br" in encoding or "gzip" in encoding or "deflate" in encoding:
+            content = decompress(content, encoding.split(",")[0].strip())
 
-        return StreamingResponse(
-            iter([content]),
-            status_code=r.status_code,
-            headers=fix_headers(r.headers),
-            media_type=r.headers.get("content-type", "application/octet-stream")
-        )
+        # Remove encoding headers so browser doesn't try to decompress again
+        headers.pop("content-encoding", None)
+        headers.pop("transfer-encoding", None)
+        headers["content-length"] = str(len(content))
+
+        # Very simple link rewriting so the proxy stays working
+        if "text/html" in headers.get("content-type", ""):
+            content = content.decode("utf-8", errors="ignore")
+            content = content.replace('href="//', 'href="https://')
+            content = content.replace("href='/", f'href="/?url={url.rstrip("/")}/')
+            content = content.replace('src="/', f'src="/?url={url.rstrip("/")}/')
+            content = content.encode("utf-8")
+
+        return Response(content, status=r.status_code, headers=headers)
+
     except Exception as e:
-        return Response(f"Proxy error: {str(e)}", status_code=502)
+        return f"<h1>Error</h1>{str(e)}", 502
+
+if __name__ == "__main__":
+    app.run()
