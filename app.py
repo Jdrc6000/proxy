@@ -9,5 +9,3 @@ def home():
 @app.route("/drift")
 def drift():
     return render_template("drifting_scratch.html")
-
-app.run()
